@@ -15,6 +15,8 @@ def parser() -> argparse.ArgumentParser:
     source = gui.add_mutually_exclusive_group()
     source.add_argument("--data-dir", type=Path, help="Directory containing existing observation CSVs.")
     source.add_argument("--demo", action="store_true", help="Use explicitly fictional bundled observations.")
+    gui.add_argument("--mihomo-db", type=Path, help="Optional existing local ledger for independent, read-only Unknown service details.")
+    gui.add_argument("--view", choices=("overview", "processes", "events", "connections", "unknown"), default="overview", help="Initial dashboard page.")
     collect = commands.add_parser("collect", help="Run an optional, separate Windows metadata collector.")
     collect.add_argument("--output-dir", type=Path, required=True)
     collect.add_argument("--interval", type=float, default=10)
@@ -33,10 +35,13 @@ def main(argv=None) -> int:
     command = args.command or "gui"
     if command == "gui":
         demo = bool(getattr(args,"demo",False))
+        mihomo_db = getattr(args, "mihomo_db", None)
+        if demo and mihomo_db is not None:
+            cli.error("--demo cannot be combined with a real --mihomo-db.")
         directory = Path(__file__).resolve().parent / "demo" if demo else getattr(args,"data_dir",None)
         try:
             from .ui import launch
-            launch(directory, demo=demo)
+            launch(directory, demo=demo, mihomo_db=mihomo_db, view=getattr(args, "view", "overview"))
             return 0
         except ImportError as error:
             if error.name in {"tkinter", "_tkinter"}:

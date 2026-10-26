@@ -18,11 +18,13 @@ from pathlib import Path
 from typing import Any
 
 from .probes.common import local_path
+from .unknown import build_unknown_breakdown
 
 UTC = dt.timezone.utc
 FILES = (
     "physical_network.csv", "sample_summary.csv", "process_snapshots.csv",
     "codex_activity.csv", "anomaly_windows.csv", "live_connections.csv", "monitor_health.csv",
+    "logical_traffic.csv",
 )
 _ROW_START = re.compile(rb"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127},[0-9]+,")
 
@@ -203,10 +205,12 @@ class AuditStore:
     12,000 rows per source are retained, and partial coverage is explicit.
     ``minutes=None`` or ``minutes=0`` means all retained data for that run.
     """
-    def __init__(self, directory: str | Path):
+    def __init__(self, directory: str | Path, mihomo_db: str | Path | None = None):
         self.directory = local_path(directory)
         self._readers = {name: _CsvTail(self.directory / name) for name in FILES}
         self._last_clock = None
+        self._mihomo_db = mihomo_db
+        self._ledger_details = None
 
     def _read_json(self, name: str, maximum: int = 2 * 1024 * 1024) -> dict:
         try:
@@ -405,12 +409,32 @@ class AuditStore:
             limitations.insert(0,"模拟数据：完全虚构，不代表本机或任何真实用户的网络活动。")
         if historical:
             limitations.append("当前选择的是历史运行段；实例列表表示该段最后一次观察，不代表现在存活。")
+        unknown = build_unknown_breakdown(selected_rows("sample_summary.csv"),
+            selected_rows("logical_traffic.csv"), selected_rows("process_snapshots.csv"),
+            start=start, end=end, source_coverage=coverage)
+        ledger = {"status":"not_configured", "reason":"synthetic_demo_ignores_external_database" if demo
+            else "no_database_selected", "rows":[], "total_up":None, "total_down":None,
+            "limitations":["原账本完整桶视角与监测增量口径独立，不能相加。"]}
+        if self._mihomo_db is not None and not demo and selected and end is not None:
+            from .ledger_details import UnknownLedgerDetails
+            if self._ledger_details is None:
+                self._ledger_details = UnknownLedgerDetails(self._mihomo_db)
+            # All-retained mode still needs a real lower bound for independent
+            # bucket inspection. Do not infer it from cumulative state totals.
+            ledger_start = start
+            if ledger_start is None:
+                starts = [_timestamp(_object(r.get("logical_totals")).get("delta_interval_start_utc"))
+                    for r in selected_rows("sample_summary.csv")]
+                ledger_start = min((value for value in starts if value is not None),
+                                   default=discovered[selected]["_start"])
+            ledger = self._ledger_details.snapshot(_iso(ledger_start), _iso(end))
         return {"runs":runs,"selected_run":selected,"source_status":{"monitor":status,"connections":connection_status,"data_directory":str(self.directory)},
             "freshness":{"age_seconds":age,"stale":stale,"demo":demo,"historical":historical},
             "totals":totals,"series":series,"processes":processes,"events":events[:2000],
             "markers":markers[-500:],"connections":connections,"limitations":list(dict.fromkeys(limitations)),
             "window":{"start_utc":_iso(start),"end_utc":_iso(end),"minutes":minutes,"complete":not totals_partial},"coverage":coverage,
             "totals_partial":totals_partial,
+            "unknown_breakdown":unknown,"unknown_ledger_details":ledger,
             "measurement_coverage":{"physical_valid_intervals":len(totals_lists["physical_rx"]),
                 "logical_valid_intervals":logical_valid_samples,"physical_gap_rows":physical_gaps,"logical_gap_rows":logical_gaps},
             "demo":demo,"updated_utc":dt.datetime.now(UTC).isoformat()}

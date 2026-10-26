@@ -32,9 +32,29 @@ python -B -m traffic_observer gui --demo
 - **实例**：PID、父 PID、开始时间、进程类别、采样时间和缓存状态；进程存在不等于正在产生下载。
 - **活动**：既有元数据记录中的完成、失败、恢复等事件；日志模块行数不会当成模型调用数。
 - **连接**：来源确实提供的连接记录；缺少连接级来源时，明确展示不可用，不生成虚假连接或流量归属。
+- **未识别流量**：点击概览中的“未识别进程流量”或侧栏，按目标服务、出口标签和同期工作负载拆分；每组可查看上行、下行、占比、候选 PID 和证据缺口。
 - **时间筛选**：独立运行段、最近 15 分钟、1 小时、4 小时或当前保留范围。
 
 物理网卡和逻辑账本的时间、覆盖范围与计数层次不同，曲线只用于比较。Mihomo 写入延迟可能造成短时错位。`chatgpt.com` 是正常服务域名；它本身不能证明异常或响应内容类型。
+
+## 把 Unknown 看清楚
+
+“未识别流量”页有两个独立视角：
+
+- **监测增量 · 活动关联**：读取已有 `logical_traffic.csv`，按服务、DIRECT/匿名节点、同期进程组合拆分。多个任务同时出现时归入组合项，每份增量只计一次。缺少新鲜进程观测会明确显示缺口；“同期 Campus / Desktop”不等于这些字节已归属于它。
+- **原账本 · 服务/来源细分**：可选读取用户指定的已有 SQLite 账本，显示公共服务类别、匿名目标、匿名来源、出口和上下行。只统计完全落在选择范围内的 5 分钟桶，有独立的时间范围和覆盖说明，不能再加到监测增量里。
+
+选择一行可以看到为什么这样分类、有哪些候选实例，以及还缺什么证据。明细覆盖不到的数量单列为“明细缺失”，不会把未知部分塞给某个任务。
+
+![未识别流量细分，使用完全虚构的演示数据](docs/unknown-maximized-demo.png)
+
+在第二个视角点击“选择已有账本”，或启动时明确指定：
+
+```powershell
+python -B -m traffic_observer gui --data-dir "C:\TrafficObservations" --mihomo-db "$env:APPDATA\mihomo-party\traffic-usage.db" --view unknown
+```
+
+仅查看本地已有数据，不调用控制 API、不启动采集、不更改分流规则。数据库不可读或查询超时就显示不可用。私有域名、来源 IP 和节点名称使用匿名标识；域名类别不能推断响应正文。切换监测目录时解除原账本关联，演示模式禁止混入真实账本。
 
 ## 可选：开始新的采集
 
@@ -62,7 +82,7 @@ python -B -m traffic_observer stop --data-dir "C:\TrafficObservations"
 
 ## 数据与隐私
 
-查看器兼容以下监测输出：`physical_network.csv`、`sample_summary.csv`、`process_snapshots.csv`、`codex_activity.csv`、`live_connections.csv`、`anomaly_windows.csv`、`monitor_health.csv`、`monitor_state.json`。单个数据源缺失时可继续查看其余来源。公开版采集器不具备所有原始审计适配器，因此部分活动或工作负载标签来自导入数据，而非公开版的自动发现。
+查看器兼容以下监测输出：`physical_network.csv`、`sample_summary.csv`、`logical_traffic.csv`、`process_snapshots.csv`、`codex_activity.csv`、`live_connections.csv`、`anomaly_windows.csv`、`monitor_health.csv`、`monitor_state.json`。单个数据源缺失时可继续查看其余来源。公开版采集器不具备所有原始审计适配器，因此部分活动或工作负载标签来自导入数据，而非公开版的自动发现。
 
 所有真实观测都应存放在源码仓库之外。`.gitignore` 排除运行日志、数据库、CSV 和状态文件；只有 `traffic_observer/demo/` 下明确标记的虚构数据例外。界面只读取本地文件，不上传数据。请勿把含真实路径、活动时间或进程信息的截图与日志直接贴到公开 issue。
 

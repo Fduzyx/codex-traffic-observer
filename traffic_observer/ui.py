@@ -33,7 +33,7 @@ SERIES = (
     ("physical_rx_rate", "物理 WLAN 接收", "#007f80"),
     ("logical_down_rate", "Mihomo 逻辑下行", "#4e82bb"),
     ("codex_down_rate", "Codex 逻辑下行", "#8660b8"),
-    ("unknown_down_rate", "Unknown 逻辑下行", "#c59035"),
+    ("unknown_down_rate", "未识别进程下行", "#c59035"),
 )
 WINDOWS = {"最近 15 分钟": 15, "最近 1 小时": 60, "最近 4 小时": 240, "整个运行段": None}
 
@@ -118,7 +118,10 @@ def workload_name(value: Any) -> str:
     return {
         "CodexDesktop": "Codex Desktop",
         "CampusMainWSL": "Campus · WSL",
+        "CampusRadarWSL": "CampusRadar · WSL",
         "CampusInsights": "Campus Insights",
+        "CodexCLI": "Codex CLI",
+        "UnclassifiedCodex": "未分类 Codex",
         "VSCode": "VS Code",
         "Unknown": "未分类实例",
         "desktop_app_server": "Desktop / app-server",
@@ -240,7 +243,8 @@ class RateChart(tk.Canvas):
 class ObserverApp:
     """Read-only window. ``refresh_now`` and ``apply_snapshot`` assist local UI tests."""
 
-    def __init__(self, root: tk.Tk, directory: Path | None, demo: bool = False):
+    def __init__(self, root: tk.Tk, directory: Path | None, demo: bool = False,
+                 mihomo_db: Path | None = None):
         self.root = root
         # Use a known font baseline, then scale fonts AND pixel layout together.
         # These are process-local Tk settings, not Windows display configuration.
@@ -251,7 +255,8 @@ class ObserverApp:
         self._tree_geometry: list[tuple[ttk.Treeview, dict[str, dict[str, int]]]] = []
         self.directory = Path(directory) if directory is not None else None
         self.demo = demo
-        self.store = AuditStore(self.directory) if self.directory is not None else None
+        self.mihomo_db = None if demo or mihomo_db is None else Path(mihomo_db)
+        self.store = AuditStore(self.directory, mihomo_db=self.mihomo_db) if self.directory is not None else None
         self.snapshot: dict[str, Any] = {}
         self._queue: queue.Queue = queue.Queue()
         self._pending = False
@@ -262,6 +267,8 @@ class ObserverApp:
         self._view = "overview"
         self._compact = False
         self._event_rows: dict[str, dict[str, Any]] = {}
+        self._unknown_rows: dict[str, dict[str, dict[str, Any]]] = {"monitor": {}, "ledger": {}}
+        self._unknown_mode = "monitor"
         self._legend_vars: dict[str, tk.BooleanVar] = {}
         self._after_ids: dict[str, str] = {}
         self._last_refresh = 0.0
@@ -280,7 +287,7 @@ class ObserverApp:
         self._capture_design_geometry()
         self.root.bind("<F5>", lambda _: self.refresh_now())
         self.root.bind("<Control-o>", lambda _: self.choose_directory())
-        for key, page in enumerate(("overview", "processes", "events", "connections"), 1):
+        for key, page in enumerate(("overview", "processes", "events", "connections", "unknown"), 1):
             self.root.bind(f"<Alt-Key-{key}>", lambda _, page=page: self.show_page(page))
         self._after_ids["queue"] = root.after(100, self._drain_queue)
         self._after_ids["initial"] = root.after(50, self.refresh_now)
@@ -336,7 +343,8 @@ class ObserverApp:
         self.label(sidebar, "CODEX TRAFFIC OBSERVER", size=7, bg=SIDEBAR, color="#91adb8").grid(row=2, column=0, sticky="w", padx=25, pady=(5, 33))
         self._nav_buttons = {}
         for row, (key, text, icon) in enumerate((("overview", "流量总览", "◫"), ("processes", "进程实例", "▤"),
-                                                ("events", "活动时间线", "≡"), ("connections", "连接证据", "⇄")), 3):
+                                                ("events", "活动时间线", "≡"), ("connections", "连接证据", "⇄"),
+                                                ("unknown", "未识别流量", "◇")), 3):
             button = tk.Button(sidebar, text=f"{icon}   {text}", font=(FONT, 11), anchor="w", padx=21, pady=13,
                                background=SIDEBAR, foreground="#aec2ca", activebackground="#23424f",
                                activeforeground="white", relief="flat", borderwidth=0, cursor="hand2",
@@ -390,18 +398,19 @@ class ObserverApp:
         self.pages.grid(row=3, column=0, sticky="nsew", padx=28)
         self.pages.grid_rowconfigure(0, weight=1)
         self.pages.grid_columnconfigure(0, weight=1)
-        self.page_frames = {name: tk.Frame(self.pages, bg=BG) for name in ("overview", "processes", "events", "connections")}
+        self.page_frames = {name: tk.Frame(self.pages, bg=BG) for name in ("overview", "processes", "events", "connections", "unknown")}
         for frame in self.page_frames.values():
             frame.grid(row=0, column=0, sticky="nsew")
         self._build_overview(self.page_frames["overview"])
         self._build_processes(self.page_frames["processes"])
         self._build_events(self.page_frames["events"])
         self._build_connections(self.page_frames["connections"])
+        self._build_unknown(self.page_frames["unknown"])
         footer = tk.Frame(main, bg=BG)
         self.footer = footer
         footer.grid(row=4, column=0, sticky="ew", padx=29, pady=(12, 15))
         self.label(footer, "UTC 时间戳按本地时区显示 · 数值使用 IEC 字节单位", size=8, color=MUTED, bg=BG).pack(side="left")
-        self.label(footer, "F5 刷新   Ctrl+O 选择目录   Alt+1…4 切换视图", size=8, color=MUTED, bg=BG).pack(side="right")
+        self.label(footer, "F5 刷新   Ctrl+O 选择目录   Alt+1…5 切换视图", size=8, color=MUTED, bg=BG).pack(side="right")
         self.show_page("overview")
         main.bind("<Configure>", self._adaptive_layout)
 
@@ -414,7 +423,7 @@ class ObserverApp:
         self.metric_values, self.metric_subtitles, self.metric_titles = {}, {}, {}
         for column, (key, name, color) in enumerate((("physical_rx", "物理 WLAN 接收", "#007f80"),
                 ("logical_down", "Mihomo 逻辑下行", "#4e82bb"), ("codex_down", "Codex 逻辑下行", "#8660b8"),
-                ("unknown_down", "Unknown 逻辑下行", "#c59035"))):
+                ("unknown_down", "未识别进程流量", "#c59035"))):
             cards.grid_columnconfigure(column, weight=1, uniform="metric")
             card = tk.Frame(cards, bg=SURFACE, highlightbackground=LINE, highlightthickness=1)
             card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 6, 0 if column == 3 else 6))
@@ -428,6 +437,13 @@ class ObserverApp:
             self.metric_values[key], self.metric_subtitles[key] = value, detail
             self.metric_titles[key] = title
             card.bind("<Configure>", lambda event, label=value: self._fit_metric(label, event.width - round(32 * self._ui_scale)))
+            if key == "unknown_down":
+                for target in (card, title, value, detail):
+                    target.configure(cursor="hand2")
+                    target.bind("<Button-1>", lambda _: self.show_page("unknown"))
+                card.configure(takefocus=True)
+                card.bind("<Return>", lambda _: self.show_page("unknown"))
+                card.bind("<space>", lambda _: self.show_page("unknown"))
         chart_panel = tk.Frame(parent, bg=SURFACE, highlightbackground=LINE, highlightthickness=1)
         chart_panel.grid(row=1, column=0, sticky="nsew")
         chart_panel.grid_columnconfigure(0, weight=1)
@@ -448,7 +464,7 @@ class ObserverApp:
             check.pack(side="left", padx=(0, 12))
         self.chart = RateChart(chart_panel, height=250)
         self.chart.grid(row=2, column=0, sticky="nsew", padx=10, pady=(3, 3))
-        self.label(chart_panel, "逻辑曲线按落库增量折算，可能滞后于网卡；Codex 与 Unknown 属于逻辑总量的子集，不应相加。",
+        self.label(chart_panel, "逻辑曲线按落库增量折算，可能滞后于网卡；Codex 与未识别进程属于逻辑总量的子集，不应相加。",
                    size=8, color=MUTED, anchor="w").grid(row=3, column=0, sticky="ew", padx=20, pady=(1, 14))
         lower = tk.Frame(parent, bg=BG)
         self.overview_lower = lower
@@ -562,6 +578,9 @@ class ObserverApp:
             self.chart.ui_scale = scale
             self.chart.draw()
         self.notice.configure(wraplength=max(300, width - round((207 + 58) * scale)), justify="left")
+        for mode, expanded in self._unknown_expanded.items():
+            if expanded:
+                self.unknown_table_holders[mode].grid_remove()
         if not changed and not mode_changed:
             return
         self._compact = compact
@@ -649,6 +668,99 @@ class ObserverApp:
         self.label(parent, "同一连接的累计计数才可差分；连接重建本身不是重复下载证据。界面不会调用或开启控制接口。",
                    color=MUTED, size=9, bg=BG, anchor="w").pack(fill="x", pady=(13, 2))
 
+    def _build_unknown(self, parent: tk.Frame) -> None:
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(3, weight=1)
+        summary = tk.Frame(parent, bg=SURFACE, highlightbackground=LINE, highlightthickness=1)
+        summary.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        self.unknown_metrics = {}
+        for column, (key, title) in enumerate((("down", "未识别进程下行"), ("up", "未识别进程上行"), ("rows", "可查看的分组"))):
+            summary.grid_columnconfigure(column, weight=1, uniform="unknown_metric")
+            cell = tk.Frame(summary, bg=SURFACE, padx=16, pady=10)
+            cell.grid(row=0, column=column, sticky="nsew")
+            self.label(cell, title, color=MUTED, size=8).pack(anchor="w")
+            value = self.label(cell, "—", size=18, bold=True, color="#9b681c" if key == "down" else INK)
+            value.pack(anchor="w", pady=(3, 0))
+            self.unknown_metrics[key] = value
+        controls = tk.Frame(parent, bg=BG)
+        controls.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self.unknown_mode_buttons = {}
+        for mode, text in (("monitor", "监测增量 · 活动关联"), ("ledger", "原账本 · 服务 / 来源细分")):
+            button = self.button(controls, text, lambda mode=mode: self._show_unknown_mode(mode))
+            button.pack(side="left", padx=(0, 8))
+            self.unknown_mode_buttons[mode] = button
+        self.ledger_button = self.button(controls, "选择已有账本", self.choose_ledger)
+        self.ledger_button.pack(side="right")
+        if self.demo:
+            self.ledger_button.configure(state="disabled")
+        self.unknown_scope = self.label(parent, "等待未识别流量明细。", color=MUTED, size=8, bg=BG,
+                                        anchor="w", justify="left", wraplength=1000)
+        self.unknown_scope.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        self.unknown_scope.bind("<Configure>", lambda event: self.unknown_scope.configure(wraplength=max(250, event.width)))
+        self.unknown_views, self.unknown_trees, self.unknown_evidence = {}, {}, {}
+        self.unknown_table_holders, self.unknown_expand_buttons = {}, {}
+        self._unknown_expanded = {"monitor": False, "ledger": False}
+        for mode in ("monitor", "ledger"):
+            frame = tk.Frame(parent, bg=BG)
+            frame.grid(row=3, column=0, sticky="nsew")
+            frame.grid_columnconfigure(0, weight=1)
+            frame.grid_rowconfigure(0, weight=3)
+            frame.grid_rowconfigure(1, weight=2)
+            self.unknown_views[mode] = frame
+            holder = tk.Frame(frame, bg=BG)
+            holder.grid(row=0, column=0, sticky="nsew")
+            self.unknown_table_holders[mode] = holder
+            columns = [("service", "目标服务", 175), ("route", "出口", 110)]
+            columns.append(("context", "同期活跃 · 仅候选" if mode == "monitor" else "匿名来源", 205 if mode == "monitor" else 145))
+            columns += [("down", "下行", 100), ("up", "上行", 100), ("share", "下行占比", 85), ("confidence", "证据等级", 135)]
+            tree = self._table(holder, columns, height=4)
+            tree.bind("<<TreeviewSelect>>", lambda _, mode=mode: self._show_unknown_evidence(mode))
+            self.unknown_trees[mode] = tree
+            details = tk.Frame(frame, bg="#eaf1f2", padx=13, pady=9)
+            details.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+            details.grid_columnconfigure(0, weight=1)
+            details.grid_rowconfigure(1, weight=1)
+            heading = tk.Frame(details, bg="#eaf1f2")
+            heading.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 5))
+            self.label(heading, "安全证据与归因边界", size=9, bold=True, bg="#eaf1f2").pack(side="left")
+            expand = tk.Button(heading, text="展开证据 ↗", command=lambda mode=mode: self._toggle_unknown_evidence(mode),
+                               font=(FONT, 8), fg=ACCENT, bg="#eaf1f2", relief="flat", borderwidth=0, padx=4, pady=0,
+                               cursor="hand2", takefocus=True)
+            expand.pack(side="right")
+            self.unknown_expand_buttons[mode] = expand
+            text = tk.Text(details, wrap="word", height=5, width=20, font=(FONT, 9), bg="#eaf1f2", fg="#365b62",
+                           relief="flat", borderwidth=0, highlightthickness=0, padx=0, pady=0,
+                           cursor="arrow", state="disabled", takefocus=True)
+            text.grid(row=1, column=0, sticky="nsew")
+            scrollbar = ttk.Scrollbar(details, orient="vertical", command=text.yview)
+            scrollbar.grid(row=1, column=1, sticky="ns")
+            text.configure(yscrollcommand=scrollbar.set)
+            self.unknown_evidence[mode] = text
+            self._set_unknown_evidence(mode, "选择一行查看安全证据、候选 PID、未确认原因及统计覆盖。\n服务或出口已识别，也不等于产生流量的进程已识别。")
+        self._show_unknown_mode("monitor")
+
+    def _set_unknown_evidence(self, mode: str, text: str) -> None:
+        widget = self.unknown_evidence[mode]
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", text)
+        widget.configure(state="disabled")
+
+    def _toggle_unknown_evidence(self, mode: str) -> None:
+        expanded = not self._unknown_expanded[mode]
+        self._unknown_expanded[mode] = expanded
+        holder = self.unknown_table_holders[mode]
+        holder.grid_remove() if expanded else holder.grid()
+        self.unknown_views[mode].grid_rowconfigure(0, weight=0 if expanded else 3)
+        self.unknown_expand_buttons[mode].configure(text="返回列表 ↙" if expanded else "展开证据 ↗")
+
+    def _show_unknown_mode(self, mode: str) -> None:
+        self._unknown_mode = mode
+        self.unknown_views[mode].tkraise()
+        for key, button in self.unknown_mode_buttons.items():
+            button.configure(background=ACCENT if key == mode else SURFACE, foreground="white" if key == mode else INK)
+        self._update_unknown_summary()
+
     def show_page(self, name: str) -> None:
         self._view = name
         self.page_frames[name].tkraise()
@@ -657,6 +769,7 @@ class ObserverApp:
             "processes": ("进程实例", "查看进程身份与来源时间；保留归属判断的边界。"),
             "events": ("活动时间线", "只展示允许的活动元数据，不读取提示词或响应正文。"),
             "connections": ("连接证据", "逐连接归因依赖真实连接元数据；缺失时明确留白。"),
+            "unknown": ("未识别流量", "按服务、出口与安全元数据拆分；同期活跃任务仍只是候选。"),
         }
         title, subtitle = titles[name]
         self.title_label.configure(text=title)
@@ -690,12 +803,34 @@ class ObserverApp:
             return
         self.directory = candidate
         self.demo = False
+        self.mihomo_db = None
         self.store = store
         self._generation += 1
         self._run_id = None
         self.run_var.set("最新运行段")
         self.directory_label.configure(text=str(self.directory))
         self.snapshot = {}
+        self.refresh_now()
+
+    def choose_ledger(self) -> None:
+        if self.demo or _truth(self.snapshot.get("demo")) or _truth((self.snapshot.get("freshness") or {}).get("demo")):
+            return
+        if self.directory is None:
+            self.notice.configure(text="请先选择已有监测数据目录，再选择与它对应的本地账本。", foreground="#9b681c")
+            return
+        chosen = filedialog.askopenfilename(parent=self.root, title="只读打开与当前监测对应的已有流量账本",
+            filetypes=[("SQLite 流量账本", "*.db"), ("所有文件", "*.*")])
+        if not chosen:
+            return
+        candidate = Path(chosen)
+        try:
+            store = AuditStore(self.directory, mihomo_db=candidate)
+        except (OSError, ValueError):
+            self.notice.configure(text="无法打开该账本。请选择可读取的本地数据库；原数据源未改变。", foreground="#9b681c")
+            return
+        self.mihomo_db, self.store = candidate, store
+        self._generation += 1
+        self._show_unknown_mode("ledger")
         self.refresh_now()
 
     def refresh_now(self) -> None:
@@ -808,7 +943,7 @@ class ObserverApp:
         self.metric_subtitles["physical_rx"].configure(text=f"已验证区间发送 {format_bytes(totals.get('physical_tx'))}" if partial else f"同期发送 {format_bytes(totals.get('physical_tx'))}")
         self.metric_subtitles["logical_down"].configure(text="已验证区间增量 · 覆盖不完整" if partial else "账本记录增量 · 非物理总量")
         self.metric_subtitles["codex_down"].configure(text="按进程名聚合 · 未分到 PID")
-        self.metric_subtitles["unknown_down"].configure(text="身份未明 · 不猜测归属")
+        self.metric_subtitles["unknown_down"].configure(text="下行 · 点击查看拆分 →")
         self.chart.set_data(payload.get("series") or [])
         start, end = window.get("start_utc"), window.get("end_utc")
         self.chart_range.configure(text=f"{local_time(start)} — {local_time(end)}" if end else "等待有效时间范围")
@@ -820,13 +955,220 @@ class ObserverApp:
                                       + ("连接级字节缺失，无法定位最大连接。" if missing else "已读取连接元数据；仍需保留归因边界。"))
         logical, unknown = _number(totals.get("logical_down")), _number(totals.get("unknown_down"))
         if logical and unknown is not None:
-            message = f"Unknown 占逻辑下行约 {unknown / logical * 100:.1f}%。保留未知身份，避免把同时间的任务直接当作流量来源。"
+            message = f"未识别进程占逻辑下行约 {unknown / logical * 100:.1f}%。可查看服务与同期活动拆分；时间重合不证明流量归属。"
         else:
             message = "接收量说明发生了传输；实例同时存在并不证明它产生了这些字节。"
         self.insight_label.configure(text=message)
         self._render_processes()
         self._render_events()
         self._render_connections(connection_status)
+        self.ledger_button.configure(state="disabled" if is_demo else "normal")
+        self._render_unknown()
+
+    @staticmethod
+    def _unknown_service(value: Any) -> str:
+        return {"chatgpt": "ChatGPT / Codex 服务", "chatgpt.com": "ChatGPT / Codex 服务",
+                "chatgpt_exact": "ChatGPT 主域", "chatgpt_subdomain": "ChatGPT 子域",
+                "openai": "OpenAI 服务", "google": "Google 服务", "google_drive": "Google Drive",
+                "microsoft": "Microsoft 服务", "microsoft_update": "Microsoft 更新", "github": "GitHub 服务",
+                "tencent": "腾讯服务", "other": "目标未细分", "other_domain": "其他域名 / 服务未细分",
+                "ip_target": "IP 目标 / 服务未细分", "invalid_or_nonhost": "目标格式无法分类",
+                "empty_target": "目标未记录",
+                "unknown": "目标未细分", "missing": "目标未细分 / 明细缺失"}.get(str(value), _text(value))
+
+    @staticmethod
+    def _unknown_level(value: Any) -> str:
+        return {"coobserved_only": "同期观察 · 未归属", "process_observation_missing": "缺少进程观察",
+                "ledger_aggregate": "账本聚合 · 未归属", "missing_detail": "明细缺失"}.get(str(value), "尚未确认归属")
+
+    @staticmethod
+    def _unknown_alias(value: Any) -> str:
+        text = _text(value)
+        if text == "route_unavailable":
+            return "出口未记录"
+        for prefix, label in (("route_", "非DIRECT"), ("node_", "非DIRECT"), ("source_", "来源"), ("target_", "目标")):
+            if text.startswith(prefix):
+                return label + " #" + text[len(prefix):len(prefix) + 6]
+        return text
+
+    @staticmethod
+    def _address_kind(value: Any) -> str:
+        return {"ipv4": "IPv4", "ipv6": "IPv6", "empty": "未记录", "non_ip": "非 IP 字段",
+                "domain": "域名", "not_applicable": "不适用", "unspecified": "未指定",
+                "loopback": "回环", "private": "私有", "global": "公共", "link_local": "链路本地",
+                "multicast": "多播", "reserved": "保留"}.get(str(value), _text(value))
+
+    @staticmethod
+    def _unknown_note(value: Any) -> str:
+        return {
+            "Independent complete-bucket ledger totals; never add to or apportion monitored delta totals.": "原账本完整桶是独立总量，不能与监测增量相加或按它分摊。",
+            "Service labels identify public domain namespaces, not an application, payload type, PID or account.": "服务分类仅识别公共域名类别，不能证明应用、传输内容类型、PID 或账号。",
+            "Retained bucket rows do not prove continuous capture or complete traffic coverage.": "留存统计桶不能证明连续采集或完整流量覆盖。",
+            "Unknown remains Unknown; source and route aliases do not identify a workload.": "未识别身份保持未知；匿名来源与出口别名不能识别工作负载。",
+            "Aliases are stable only for this adapter instance and are not persisted as an identity map.": "匿名别名仅在当前查看器的数据源实例中稳定，不跨启动跟踪身份。",
+            "Closed time buckets can still receive late writes; results reflect a single read snapshot.": "已结束的桶仍可能收到延迟落库；这里只反映本次只读快照。",
+            "not_read": "尚未读取原账本。", "invalid_range": "未获得有效的统计时间范围。",
+            "no_complete_five_minute_bucket": "所选范围不足一个完整 5 分钟桶。",
+            "synthetic_demo_ignores_external_database": "模拟演示不会连接真实账本。",
+            "local_database_unavailable": "所选本地账本不存在或不可读。",
+            "wal_sidecar_unavailable": "缺少安全只读所需的 WAL 辅助文件；未创建文件或干预数据库。",
+            "database_read_unavailable": "账本当前无法安全只读查询；未修复或干预数据库。",
+            "query_deadline_exceeded": "只读查询达到时间预算，已停止本次查询。",
+            "query_key_limit": "查询分组过多，达到安全读取上限。", "no_retained_buckets": "此范围没有留存的完整统计桶。",
+            "invalid_bucket_alignment": "统计桶时间没有对齐，未将其作为有效明细。",
+            "invalid_byte_counters": "账本包含无效字节计数，未生成合计。",
+        }.get(str(value), _text(value, 1200))
+
+    def _update_unknown_summary(self) -> None:
+        mode = self._unknown_mode
+        block = self.snapshot.get("unknown_breakdown" if mode == "monitor" else "unknown_ledger_details") or {}
+        down = block.get("total_down")
+        if mode == "monitor" and not block:
+            down = (self.snapshot.get("totals") or {}).get("unknown_down")
+        self.unknown_metrics["down"].configure(text=format_bytes(down))
+        self.unknown_metrics["up"].configure(text=format_bytes(block.get("total_up")))
+        group_count = len(self._unknown_rows.get(mode) or {})
+        self.unknown_metrics["rows"].configure(text=str(group_count) if block.get("status") not in (None, "not_configured", "unavailable", "insufficient_range") else "—")
+        if mode == "monitor":
+            window = self.snapshot.get("window") or {}
+            scope = f"监测增量  {local_time(window.get('start_utc'), True)} — {local_time(window.get('end_utc'), True)}"
+            coverage = block.get("coverage") or {}
+            scope += f"  ·  可匹配明细 {_text(coverage.get('matched_samples'))} / {_text(coverage.get('summary_samples'))} 个采样区间"
+            if coverage.get("complete") is False:
+                scope += "  ·  明细覆盖不完整"
+            if not block:
+                scope += "\n现有记录没有可用拆分。未识别进程流量不等于异常流量，也不能直接归给同期任务。"
+            else:
+                scope += "\n仅合计已验证监测增量；活动与流量同窗出现，不代表属于该任务。明细缺额单列，不推测服务。"
+        else:
+            status = block.get("status")
+            if status in (None, "not_configured"):
+                scope = "原账本尚未启用。选择已有本地账本后，可只读查看完整 5 分钟桶的服务与匿名来源。"
+                if self.demo or _truth(self.snapshot.get("demo")):
+                    scope = "模拟演示未连接真实账本。此处未启用，不代表未识别流量为零。"
+            else:
+                coverage = block.get("actual_coverage") or {}
+                scope = f"原账本完整桶  {local_time(block.get('start_utc'), True)} — {local_time(block.get('end_utc'), True)}"
+                scope += f"  ·  已保留 {_text(coverage.get('bucket_count'))} / {_text(coverage.get('expected_bucket_count'))} 个 5 分钟桶"
+                if coverage.get("complete_range") is False:
+                    scope += "  ·  桶覆盖有缺口"
+                if status != "ok":
+                    scope += "  ·  该范围暂无可用明细"
+            scope += "\n这是独立完整桶总量，不能细分、替代或叠加另一视角的监测增量。"
+        self.unknown_scope.configure(text=scope)
+
+    def _render_unknown(self) -> None:
+        breakdown = self.snapshot.get("unknown_breakdown") or {}
+        groups = [dict(row) for row in (breakdown.get("groups") or []) if isinstance(row, dict)]
+        residual_down, residual_up = _number(breakdown.get("residual_down")), _number(breakdown.get("residual_up"))
+        if (residual_down or 0) > 0 or (residual_up or 0) > 0:
+            total = _number(breakdown.get("total_down"))
+            groups.append({"group_id": "__missing_detail__", "service_category": "missing", "route_alias": "出口未细分",
+                           "workload_label": "活动关联明细缺失", "download_bytes": residual_down, "upload_bytes": residual_up,
+                           "download_share": residual_down / total if total and residual_down is not None else None,
+                           "evidence_level": "missing_detail", "candidates": [],
+                           "evidence": ["来自有效监测汇总与可匹配明细之间的差额，未伪造服务、连接或 PID。"],
+                           "limitations": ["缺少能够与该增量一一匹配的明细，不能分配到目标服务或工作负载。"]})
+        ledger = self.snapshot.get("unknown_ledger_details") or {}
+        for mode, rows in (("monitor", groups), ("ledger", ledger.get("rows") or [])):
+            tree = self.unknown_trees[mode]
+            selection = tree.selection()
+            old = self._unknown_rows[mode].get(selection[0]) if selection else None
+            old_identity = old.get("_ui_identity") if old else None
+            tree.delete(*tree.get_children())
+            self._unknown_rows[mode] = {}
+            preferred = None
+            for index, source_row in enumerate(rows):
+                if not isinstance(source_row, dict):
+                    continue
+                row = dict(source_row)
+                service = self._unknown_service(row.get("service_category"))
+                route = self._unknown_alias(row.get("route_alias"))
+                if mode == "monitor":
+                    activity = _text(row.get("workload_label"))
+                    activity = activity.replace("仅新鲜观测到 Desktop（非独占归属）", "Desktop")
+                    context = activity + " · 候选" if row.get("candidates") else activity
+                    share = _number(row.get("download_share"))
+                    confidence = self._unknown_level(row.get("evidence_level"))
+                    identity = str(row.get("group_id") or index)
+                else:
+                    target = _text(row.get("target_alias"))
+                    if target != "—" and not target.startswith("service_") and target not in service:
+                        service += " · " + self._unknown_alias(target)
+                    context = self._unknown_alias(row.get("source_alias"))
+                    total, amount = _number(ledger.get("total_down")), _number(row.get("download_bytes"))
+                    share = amount / total if total and amount is not None else None
+                    confidence = self._unknown_level("ledger_aggregate")
+                    identity = "|".join(str(row.get(key) or "") for key in ("service_category", "target_alias", "source_alias", "route_alias"))
+                row["_ui_identity"] = identity
+                item = tree.insert("", "end", values=(service, route, context, format_bytes(row.get("download_bytes")),
+                    format_bytes(row.get("upload_bytes")), f"{share * 100:.1f}%" if share is not None else "—", confidence),
+                    tags=("warning",) if row.get("evidence_level") == "missing_detail" else (("alternate",) if index % 2 else ()))
+                self._unknown_rows[mode][item] = row
+                if identity == old_identity:
+                    preferred = item
+            children = tree.get_children()
+            if children:
+                tree.selection_set(preferred or children[0])
+                self._show_unknown_evidence(mode)
+            else:
+                limitation = "\n".join(self._unknown_note(item) for item in (breakdown if mode == "monitor" else ledger).get("limitations", [])[:12])
+                reason = self._unknown_note((breakdown if mode == "monitor" else ledger).get("reason"))
+                text = "当前没有可展示的拆分行。没有明细不等于没有流量。\n"
+                if mode == "ledger":
+                    text += "需要已保留且完整的 5 分钟桶；未选择账本或范围不足时保留未知值。\n"
+                if reason != "—":
+                    text += "来源状态：" + reason + "\n"
+                self._set_unknown_evidence(mode, text + limitation)
+        self._update_unknown_summary()
+
+    def _show_unknown_evidence(self, mode: str) -> None:
+        selected = self.unknown_trees[mode].selection()
+        row = self._unknown_rows[mode].get(selected[0]) if selected else None
+        if not row:
+            return
+        block = self.snapshot.get("unknown_breakdown" if mode == "monitor" else "unknown_ledger_details") or {}
+        lines = []
+        target_reason = {"other": "已有记录未提供进一步可验证的目标服务分类。",
+            "other_domain": "目标未匹配已识别服务类别；不反推匿名目标。",
+            "ip_target": "仅有 IP 类目标，未进行外网查询或反向解析。",
+            "invalid_or_nonhost": "记录中的目标不是可分类的有效主机字段。",
+            "empty_target": "已有记录的目标字段为空。", "unknown": "已有记录未提供可验证的目标分类。",
+            "missing": "汇总增量没有可匹配明细，无法知道其目标、出口或同期进程。"}.get(str(row.get("service_category")))
+        if target_reason:
+            lines.append("目标未细分原因：" + target_reason)
+        if mode == "monitor":
+            lines.append("归因边界：仅在同一观察区间出现；候选 PID / 任务不是已确认的字节来源。")
+            lines.append(f"所选分组：{self._unknown_service(row.get('service_category'))}；出口 {_text(row.get('route_alias'))}；同期组合 {_text(row.get('workload_label'))}。")
+            lines.append(f"统计覆盖：{local_time(row.get('first_utc'), True)} — {local_time(row.get('last_utc'), True)}；匹配区间 {_text(row.get('sample_count'))} 个。")
+            candidates = row.get("candidates") or []
+            if not candidates:
+                lines.append("候选 PID：没有可匹配的安全进程元数据，保持未知。")
+            for candidate in candidates[:30]:
+                if not isinstance(candidate, dict):
+                    continue
+                lines.append(f"同期候选：{workload_name(candidate.get('workload'))} · PID {_text(candidate.get('pid'))} / 父 PID {_text(candidate.get('parent_pid'))} · {_text(candidate.get('platform'))} · 程序类别 {_text(candidate.get('exe_category'))}")
+                lines.append(f"  进程取样 {local_time(candidate.get('source_observed_utc'), True)}；启动 {local_time(candidate.get('start_utc'), True)}；类别依据 {_text(candidate.get('confidence'))}（不是流量归属置信度）。")
+            if len(candidates) > 30:
+                lines.append(f"共 {len(candidates)} 个同期候选，界面展示前 30 个；未将字节分配给它们。")
+            for evidence in (row.get("evidence") or [])[:16]:
+                lines.append("安全证据：" + _text(evidence, 1200))
+            lines.append("为何未确认：历史明细不含可核验的连接到 PID 字节映射，时间重合本身不足以确认产生流量的实例。")
+        else:
+            coverage = block.get("actual_coverage") or {}
+            lines.append("证据类型：原账本中未识别进程的完整 5 分钟桶聚合；此处不关联或分摊给同期任务。")
+            lines.append(f"服务：{self._unknown_service(row.get('service_category'))}；目标类别 {_text(row.get('target_kind'))} / 别名 {_text(row.get('target_alias'))}；匿名来源 {_text(row.get('source_alias'))}；出口 {_text(row.get('route_alias'))}。")
+            lines.append(f"来源类型 {self._address_kind(row.get('source_kind'))}；来源地址范围 {self._address_kind(row.get('source_scope'))}；目标地址范围 {self._address_kind(row.get('target_scope'))}。这些类别不等于 WSL、TUN 或某个 PID。")
+            lines.append("完整匿名标识见上行；短标签仅用于阅读。两个视角的匿名标识独立，不能据此认定是同一来源或节点。")
+            lines.append(f"完整桶请求范围：{local_time(block.get('start_utc'), True)} — {local_time(block.get('end_utc'), True)}（结束不包含）。")
+            lines.append(f"实际留存：{local_time(coverage.get('start_utc'), True)} — {local_time(coverage.get('end_utc'), True)}；本组 {_text(row.get('bucket_count'))} 个桶；全范围 {_text(coverage.get('bucket_count'))} / {_text(coverage.get('expected_bucket_count'))} 个桶。")
+            lines.append("为何未确认：匿名来源标识不是 PID，目标服务与出口也不能证明哪个任务产生了流量。该表总量不能与监测增量相加。")
+            if _truth(block.get("cached")):
+                age = _number(block.get("cache_age_seconds"))
+                lines.append("查询缓存：" + (f"{age:.0f} 秒前读取。" if age is not None else "非本次即时读取。"))
+        for limitation in [*(row.get("limitations") or []), *(block.get("limitations") or [])][:20]:
+            lines.append("限制：" + self._unknown_note(limitation))
+        self._set_unknown_evidence(mode, "\n".join(lines))
 
     def _render_processes(self) -> None:
         rows = self.snapshot.get("processes") or []
@@ -919,7 +1261,8 @@ class ObserverApp:
         self.root.destroy()
 
 
-def launch(directory: Path | None = None, *, demo: bool = False) -> None:
+def launch(directory: Path | None = None, *, demo: bool = False,
+           mihomo_db: Path | None = None, view: str = "overview") -> None:
     # Process-local display scaling only; it does not change any system setting.
     try:
         import ctypes
@@ -927,5 +1270,6 @@ def launch(directory: Path | None = None, *, demo: bool = False) -> None:
     except (AttributeError, OSError):
         pass
     root = tk.Tk()
-    ObserverApp(root, directory, demo=demo)
+    app = ObserverApp(root, directory, demo=demo, mihomo_db=mihomo_db)
+    app.show_page(view if view in app.page_frames else "overview")
     root.mainloop()
