@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-traffic-observer"
+version = "0.1.0"
+description = "An offline desktop viewer and read-only Windows collector for explainable Codex traffic observations."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "Codex Traffic Observer contributors"}]
+dependencies = []
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: Microsoft :: Windows",
+  "Topic :: System :: Monitoring",
+]
+
+[project.scripts]
+traffic-observer = "traffic_observer.__main__:main"
+
+[project.urls]
+Repository = "https://github.com/Fduzyx/codex-traffic-observer"
+Issues = "https://github.com/Fduzyx/codex-traffic-observer/issues"
+
+[tool.setuptools.packages.find]
+include = ["traffic_observer*"]
+
+[tool.setuptools.package-data]
+traffic_observer = ["demo/*.csv", "demo/*.json", "demo/*.md", "assets/*"]

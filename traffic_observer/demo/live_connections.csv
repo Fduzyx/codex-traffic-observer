@@ -1,0 +1,1 @@
+run_id,sample_id,observed_utc,source,connection_id,pid,instance_key,process_class,target_domain,started_utc,proxy_chain_alias,upload_total,download_total,upload_delta,download_delta,counter_status

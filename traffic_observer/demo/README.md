@@ -1,0 +1,1 @@
+These fixtures are completely synthetic. Every PID, timestamp, event and byte count is invented. They illustrate gaps and missing connection attribution; they are not evidence about any machine, user, service or account. The January 2000 date is intentional. No real audit files were copied.
